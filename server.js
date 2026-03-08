@@ -1,56 +1,57 @@
-import 'dotenv/config';
+﻿import 'dotenv/config';
 import express from 'express';
-import helmet from 'helmet';
 import cors from 'cors';
-import morgan from 'morgan';
-import { closePool, getConnectionInfo } from './db.js';
-import { errorHandler } from './middleware/errorHandler.js';
-import { notFound } from './middleware/notFound.js';
 import leaguesRouter from './routes/leagues.js';
 import clubsRouter from './routes/clubs.js';
 import jerseysRouter from './routes/jerseys.js';
+import productsRouter from './routes/products.js';
+import bootsRouter from './routes/boots.js';
+import categoriesRouter, {
+  subcategoriesHandler,
+  subcategoryProductsHandler,
+} from './routes/categories.js';
+import brandsRouter from './routes/brands.js';
+import navRouter from './routes/nav.js';
+import searchRouter, { featuredHandler } from './routes/search.js';
+import adminRouter from './routes/admin.js';
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT || 3000);
 
-// Security and parsing middleware (in order)
-app.use(helmet());
-app.use(cors({ origin: '*' }));
+app.use(
+  cors({
+    origin: 'http://localhost:5173',
+  })
+);
 app.use(express.json());
-app.use(morgan('dev'));
 
-// Routes
+app.get('/api/health', (_req, res) => {
+  res.json({ success: true, message: 'JassSport API running' });
+});
+app.use('/api/admin', adminRouter);
 app.use('/api/leagues', leaguesRouter);
 app.use('/api/clubs', clubsRouter);
 app.use('/api/jerseys', jerseysRouter);
+app.use('/api/products', productsRouter);
+app.use('/api/boots', bootsRouter);
+app.use('/api/categories', categoriesRouter);
+app.get('/api/subcategories', subcategoriesHandler);
+app.get('/api/subcategories/:slug/products', subcategoryProductsHandler);
+app.use('/api/brands', brandsRouter);
+app.use('/api/nav', navRouter);
+app.use('/api/search', searchRouter);
 
-// 404 middleware
-app.use(notFound);
+app.get('/api/featured', featuredHandler);
 
-// Error handler middleware (must be last)
-app.use(errorHandler);
-
-// Graceful shutdown handler
-const gracefulShutdown = async (signal) => {
-  console.log(`\nReceived ${signal}, beginning graceful shutdown...`);
-  try {
-    await closePool();
-    console.log('Database pool closed');
-    process.exit(0);
-  } catch (error) {
-    console.error('Error during shutdown:', error);
-    process.exit(1);
-  }
-};
-
-process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-process.on('SIGINT', () => gracefulShutdown('SIGINT'));
-
-// Start server
-const server = app.listen(PORT, () => {
-  const dbInfo = getConnectionInfo();
-  console.log(`Server running on port ${PORT}`);
-  console.log(`Database: ${dbInfo.host}:${dbInfo.port}/${dbInfo.database}`);
+app.use((req, res) => {
+  res.status(404).json({ success: false, error: 'Not found' });
 });
 
-export default app;
+app.use((err, _req, res, _next) => {
+  console.error(err);
+  res.status(500).json({ success: false, error: 'Something went wrong' });
+});
+
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});

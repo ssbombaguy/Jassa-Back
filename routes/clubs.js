@@ -1,154 +1,207 @@
-import express from 'express';
+﻿import express from 'express';
 import { query } from '../db.js';
+import { buildPagination, parsePaginationParams } from '../utils/query.js';
 
 const router = express.Router();
 
-/**
- * GET /api/clubs
- * List all clubs with optional league_id filter
- */
-router.get('/', async (req, res, next) => {
+router.get('/', async (req, res) => {
   try {
-    const page = Math.max(1, parseInt(req.query.page) || 1);
-    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 20));
-    const offset = (page - 1) * limit;
-    const leagueId = req.query.league_id ? parseInt(req.query.league_id) : null;
-
-    let whereClause = '';
-    let params = [];
-
-    if (leagueId) {
-      whereClause = 'WHERE league_id = $1';
-      params = [leagueId];
+    const paging = parsePaginationParams(req.query);
+    if (paging.error) {
+      return res.status(400).json({ success: false, error: paging.error });
     }
 
-    // Get total count
+    const { page, limit } = paging;
+    const { search, sort = 'name', order = 'asc' } = req.query;
+    const leagueId = req.query.league_id ? Number.parseInt(req.query.league_id, 10) : undefined;
+
+    if (req.query.league_id !== undefined && !Number.isInteger(leagueId)) {
+      return res.status(400).json({ success: false, error: 'Invalid league_id parameter' });
+    }
+
+    const sortMap = {
+      name: 'c.club_name',
+      club_name: 'c.club_name',
+      founded_year: 'c.founded_year',
+      created_at: 'c.created_at',
+    };
+
+    const sortField = sortMap[sort] || 'c.club_name';
+    const sortOrder = String(order).toLowerCase() === 'desc' ? 'DESC' : 'ASC';
+
+    const conditions = ['c.is_active = true'];
+    const values = [];
+
+    if (leagueId !== undefined) {
+      values.push(leagueId);
+      conditions.push(`c.league_id = $${values.length}`);
+    }
+
+    if (search) {
+      values.push(`%${String(search).trim()}%`);
+      conditions.push(`c.club_name ILIKE $${values.length}`);
+    }
+
+    const whereClause = `WHERE ${conditions.join(' AND ')}`;
+
     const countResult = await query(
-      `SELECT COUNT(*) as count FROM clubs ${whereClause}`,
-      params
+      `SELECT COUNT(*)::int AS total
+      FROM clubs c
+      JOIN leagues l ON l.league_id = c.league_id
+      ${whereClause}`,
+      values
     );
-    const total = parseInt(countResult.rows[0].count);
 
-    // Get paginated results
+    const total = countResult.rows[0]?.total || 0;
+    const pagination = buildPagination(page, limit, total);
+    const listValues = [...values, pagination.limit, pagination.offset];
+
     const result = await query(
-      `SELECT 
-        club_id, league_id, club_name, short_name, founded_year, 
-        city, country, primary_color, secondary_color, adidas_partner, created_at 
-       FROM clubs 
-       ${whereClause}
-       ORDER BY club_name ASC 
-       LIMIT ${leagueId ? '$2' : '$1'} OFFSET ${leagueId ? '$3' : '$2'}`,
-      leagueId ? [...params, limit, offset] : [limit, offset]
+      `SELECT
+        c.*,
+        l.league_name,
+        l.short_code
+      FROM clubs c
+      JOIN leagues l ON l.league_id = c.league_id
+      ${whereClause}
+      ORDER BY ${sortField} ${sortOrder}
+      LIMIT $${listValues.length - 1} OFFSET $${listValues.length}`,
+      listValues
     );
 
-    res.json({
+    return res.json({
       success: true,
       data: result.rows,
       pagination: {
-        page,
-        limit,
-        total,
+        page: pagination.page,
+        limit: pagination.limit,
+        total: pagination.total,
+        totalPages: pagination.totalPages,
       },
     });
   } catch (error) {
-    next(error);
+    return res.status(500).json({ success: false, error: 'Something went wrong' });
   }
 });
 
-/**
- * GET /api/clubs/:id
- * Single club with league info
- */
-router.get('/:id', async (req, res, next) => {
+router.get('/:id', async (req, res) => {
   try {
-    const { id } = req.params;
+    const id = Number.parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) {
+      return res.status(400).json({ success: false, error: 'Invalid id parameter' });
+    }
 
     const result = await query(
-      `SELECT 
-        c.club_id, c.league_id, c.club_name, c.short_name, c.founded_year, 
-        c.city, c.country, c.primary_color, c.secondary_color, c.adidas_partner, c.created_at,
-        l.league_name, l.short_code, l.confederation
-       FROM clubs c
-       LEFT JOIN leagues l ON c.league_id = l.league_id
-       WHERE c.club_id = $1`,
+      `SELECT
+        c.*,
+        l.league_name,
+        l.short_code,
+        l.country AS league_country,
+        (SELECT COUNT(*)::int FROM jerseys j WHERE j.club_id = c.club_id AND j.is_active = true) AS jersey_count
+      FROM clubs c
+      JOIN leagues l ON l.league_id = c.league_id
+      WHERE c.club_id = $1 AND c.is_active = true`,
       [id]
     );
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        error: 'Not found',
-      });
+    if (!result.rows.length) {
+      return res.status(404).json({ success: false, error: 'Not found' });
     }
 
-    res.json({
-      success: true,
-      data: result.rows[0],
-    });
+    return res.json({ success: true, data: result.rows[0] });
   } catch (error) {
-    next(error);
+    return res.status(500).json({ success: false, error: 'Something went wrong' });
   }
 });
 
-/**
- * GET /api/clubs/:id/jerseys
- * All jerseys for a club
- */
-router.get('/:id/jerseys', async (req, res, next) => {
+router.get('/:id/jerseys', async (req, res) => {
   try {
-    const { id } = req.params;
-    const page = Math.max(1, parseInt(req.query.page) || 1);
-    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 20));
-    const offset = (page - 1) * limit;
+    const id = Number.parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) {
+      return res.status(400).json({ success: false, error: 'Invalid id parameter' });
+    }
 
-    // Check if club exists
+    const paging = parsePaginationParams(req.query);
+    if (paging.error) {
+      return res.status(400).json({ success: false, error: paging.error });
+    }
+
+    const { page, limit } = paging;
+    const { search, sort = 'name', order = 'asc', jersey_type, season } = req.query;
+    const sortMap = {
+      name: 'j.name',
+      price: 'j.price_usd',
+      release_date: 'j.release_date',
+      created_at: 'j.created_at',
+    };
+    const sortField = sortMap[sort] || 'j.name';
+    const sortOrder = String(order).toLowerCase() === 'desc' ? 'DESC' : 'ASC';
+
     const clubCheck = await query(
-      'SELECT club_id FROM clubs WHERE club_id = $1',
+      'SELECT club_id FROM clubs WHERE club_id = $1 AND is_active = true',
       [id]
     );
-
-    if (clubCheck.rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        error: 'Not found',
-      });
+    if (!clubCheck.rows.length) {
+      return res.status(404).json({ success: false, error: 'Not found' });
     }
 
-    // Get total count
+    const conditions = ['j.club_id = $1', 'j.is_active = true'];
+    const values = [id];
+
+    if (jersey_type) {
+      values.push(jersey_type);
+      conditions.push(`j.jersey_type = $${values.length}`);
+    }
+
+    if (season) {
+      values.push(season);
+      conditions.push(`j.season = $${values.length}`);
+    }
+
+    if (search) {
+      values.push(`%${String(search).trim()}%`);
+      conditions.push(`j.name ILIKE $${values.length}`);
+    }
+
+    const whereClause = `WHERE ${conditions.join(' AND ')}`;
+
     const countResult = await query(
-      'SELECT COUNT(*) as count FROM jerseys WHERE club_id = $1',
-      [id]
+      `SELECT COUNT(*)::int AS total FROM jerseys j ${whereClause}`,
+      values
     );
-    const total = parseInt(countResult.rows[0].count);
 
-    // Get paginated results
+    const total = countResult.rows[0]?.total || 0;
+    const pagination = buildPagination(page, limit, total);
+    const listValues = [...values, pagination.limit, pagination.offset];
+
     const result = await query(
-      `SELECT 
-        j.jersey_id, j.club_id, j.league_id, j.product_code, j.season, 
-        j.jersey_type, j.name, j.price_usd, j.technology, j.in_stock, 
-        j.release_date, j.created_at,
-        c.club_name, c.short_name,
-        l.league_name
-       FROM jerseys j
-       JOIN clubs c ON j.club_id = c.club_id
-       JOIN leagues l ON j.league_id = l.league_id
-       WHERE j.club_id = $1
-       ORDER BY j.season DESC, j.jersey_type ASC
-       LIMIT $2 OFFSET $3`,
-      [id, limit, offset]
+      `SELECT
+        j.*,
+        c.club_name,
+        c.short_name,
+        l.league_name,
+        l.short_code
+      FROM jerseys j
+      JOIN clubs c ON c.club_id = j.club_id
+      JOIN leagues l ON l.league_id = j.league_id
+      ${whereClause}
+      ORDER BY ${sortField} ${sortOrder}
+      LIMIT $${listValues.length - 1} OFFSET $${listValues.length}`,
+      listValues
     );
 
-    res.json({
+    return res.json({
       success: true,
       data: result.rows,
       pagination: {
-        page,
-        limit,
-        total,
+        page: pagination.page,
+        limit: pagination.limit,
+        total: pagination.total,
+        totalPages: pagination.totalPages,
       },
     });
   } catch (error) {
-    next(error);
+    return res.status(500).json({ success: false, error: 'Something went wrong' });
   }
 });
 
